@@ -3,62 +3,27 @@
 
 set -u
 
-DOCKER_PROVIDER=${DOCKER_PROVIDER:-docker}
-
-case "${DOCKER_PROVIDER}" in
-ecs|ECS)
-    # AWS ECS. Enabled in /etc/ecs/ecs.config (http://docs.aws.amazon.com/AmazonECS/latest/developerguide/container-metadata.html)
-    if [[ -n "${ECS_CONTAINER_METADATA_FILE:-}" ]]; then
-      export CONTAINER_ID=$(grep ContainerID "${ECS_CONTAINER_METADATA_FILE}" | sed 's/.*: "\(.*\)",/\1/g')
-    else
-      echo "${DOCKER_PROVIDER} specified as 'ecs' but not available. See: http://docs.aws.amazon.com/AmazonECS/latest/developerguide/container-metadata.html"
-      exit 1
+function check_deprecated_env_var {
+    if [[ -n "${ACME_TOS_HASH:-}" ]]; then
+        echo "Info: the ACME_TOS_HASH environment variable is no longer used by simp_le and has been deprecated."
+        echo "simp_le now implicitly agree to the ACME CA ToS."
     fi
-    ;;
-*)
-    export CONTAINER_ID=$(sed -nE 's/^.+docker[\/-]([a-f0-9]{64}).*/\1/p' /proc/self/cgroup | head -n 1)
-    ;;
-esac
-
-if [[ -z "$CONTAINER_ID" ]]; then
-    echo "Error: can't get my container ID !" >&2
-    exit 1
-fi
+}
 
 function check_docker_socket {
     if [[ $DOCKER_HOST == unix://* ]]; then
         socket_file=${DOCKER_HOST#unix://}
         if [[ ! -S $socket_file ]]; then
-            cat >&2 <<-EOT
-ERROR: you need to share your Docker host socket with a volume at $socket_file
-Typically you should run your container with: \`-v /var/run/docker.sock:$socket_file:ro\`
-See the documentation at http://git.io/vZaGJ
-EOT
+            echo "Error: you need to share your Docker host socket with a volume at $socket_file" >&2
+            echo "Typically you should run your container with: '-v /var/run/docker.sock:$socket_file:ro'" >&2
             exit 1
         fi
     fi
 }
 
-function get_nginx_proxy_cid {
-    # Look for a NGINX_VERSION environment variable in containers that we have mount volumes from.
-    local volumes_from=$(docker_api "/containers/$CONTAINER_ID/json" | jq -r '.HostConfig.VolumesFrom[]' 2>/dev/null)
-    for cid in $volumes_from; do
-        cid=${cid%:*} # Remove leading :ro or :rw set by remote docker-compose (thx anoopr)
-        if [[ $(docker_api "/containers/$cid/json" | jq -r '.Config.Env[]' | egrep -c '^NGINX_VERSION=') = "1" ]];then
-            export NGINX_PROXY_CONTAINER=$cid
-            break
-        fi
-    done
-    if [[ -z "$(nginx_proxy_container)" ]]; then
-        echo "Error: can't get nginx-proxy container id !" >&2
-        echo "Check that you use the --volumes-from option to mount volumes from the nginx-proxy or label the nginx proxy container to use with 'com.github.jrcs.letsencrypt_nginx_proxy_companion.nginx_proxy=true'." >&2
-        exit 1
-    fi
-}
-
 function check_writable_directory {
     local dir="$1"
-    docker_api "/containers/$CONTAINER_ID/json" | jq ".Mounts[].Destination" | grep -q "^\"$dir\"$"
+    docker_api "/containers/${SELF_CID:-$(get_self_cid)}/json" | jq ".Mounts[].Destination" | grep -q "^\"$dir\"$"
     if [[ $? -ne 0 ]]; then
         echo "Warning: '$dir' does not appear to be a mounted volume."
     fi
@@ -77,26 +42,125 @@ function check_writable_directory {
 }
 
 function check_dh_group {
-    if [[ ! -f /etc/nginx/certs/dhparam.pem ]]; then
-        echo "Creating Diffie-Hellman group (can take several minutes...)"
-        openssl dhparam -out /etc/nginx/certs/.dhparam.pem.tmp 2048
-        mv /etc/nginx/certs/.dhparam.pem.tmp /etc/nginx/certs/dhparam.pem || exit 1
+    # Credits to Steve Kamerman for the background Diffie-Hellman creation logic.
+    # https://github.com/jwilder/nginx-proxy/pull/589
+    local DHPARAM_BITS="${DHPARAM_BITS:-2048}"
+    re='^[0-9]*$'
+    if ! [[ "$DHPARAM_BITS" =~ $re ]] ; then
+       echo "Error: invalid Diffie-Hellman size of $DHPARAM_BITS !" >&2
+       exit 1
+    fi
+
+    # If a dhparam file is not available, use the pre-generated one and generate a new one in the background.
+    local PREGEN_DHPARAM_FILE="/app/dhparam.pem.default"
+    local DHPARAM_FILE="/etc/nginx/certs/dhparam.pem"
+    local GEN_LOCKFILE="/tmp/le_companion_dhparam_generating.lock"
+
+    # The hash of the pregenerated dhparam file is used to check if the pregen dhparam is already in use
+    local PREGEN_HASH=$(sha256sum "$PREGEN_DHPARAM_FILE" | cut -d ' ' -f1)
+    if [[ -f "$DHPARAM_FILE" ]]; then
+        local CURRENT_HASH=$(sha256sum "$DHPARAM_FILE" | cut -d ' ' -f1)
+        if [[ "$PREGEN_HASH" != "$CURRENT_HASH" ]]; then
+            # There is already a dhparam, and it's not the default
+            echo "Info: Custom Diffie-Hellman group found, generation skipped."
+            return 0
+          fi
+
+        if [[ -f "$GEN_LOCKFILE" ]]; then
+            # Generation is already in progress
+            return 0
+        fi
+    fi
+
+    echo "Info: Creating Diffie-Hellman group in the background."
+    echo "A pre-generated Diffie-Hellman group will be used for now while the new one
+is being created."
+
+    # Put the default dhparam file in place so we can start immediately
+    cp "$PREGEN_DHPARAM_FILE" "$DHPARAM_FILE"
+    touch "$GEN_LOCKFILE"
+
+    # Generate a new dhparam in the background in a low priority and reload nginx when finished (grep removes the progress indicator).
+    (
+        (
+            nice -n +5 openssl dhparam -out "$DHPARAM_FILE" "$DHPARAM_BITS" 2>&1 \
+            && echo "Info: Diffie-Hellman group creation complete, reloading nginx." \
+            && reload_nginx
+        ) | grep -vE '^[\.+]+'
+        rm "$GEN_LOCKFILE"
+    ) &disown
+}
+
+function check_default_cert_key {
+    local cn='letsencrypt-nginx-proxy-companion'
+
+    if [[ -e /etc/nginx/certs/default.crt && -e /etc/nginx/certs/default.key ]]; then
+        default_cert_cn="$(openssl x509 -noout -subject -in /etc/nginx/certs/default.crt)"
+        # Check if the existing default certificate is still valid for more
+        # than 3 months / 7776000 seconds (60 x 60 x 24 x 30 x 3).
+        check_cert_min_validity /etc/nginx/certs/default.crt 7776000
+        cert_validity=$?
+        [[ $DEBUG == true ]] && echo "Debug: a default certificate with $default_cert_cn is present."
+    fi
+
+    # Create a default cert and private key if:
+    #   - either default.crt or default.key are absent
+    #   OR
+    #   - the existing default cert/key were generated by the container
+    #     and the cert validity is less than three months
+    if [[ ! -e /etc/nginx/certs/default.crt || ! -e /etc/nginx/certs/default.key ]] || [[ "${default_cert_cn:-}" =~ $cn && "${cert_validity:-}" -ne 0 ]]; then
+        openssl req -x509 \
+            -newkey rsa:4096 -sha256 -nodes -days 365 \
+            -subj "/CN=$cn" \
+            -keyout /etc/nginx/certs/default.key.new \
+            -out /etc/nginx/certs/default.crt.new \
+        && mv /etc/nginx/certs/default.key.new /etc/nginx/certs/default.key \
+        && mv /etc/nginx/certs/default.crt.new /etc/nginx/certs/default.crt
+        echo "Info: a default key and certificate have been created at /etc/nginx/certs/default.key and /etc/nginx/certs/default.crt."
+    elif [[ $DEBUG == true && "${default_cert_cn:-}" =~ $cn ]]; then
+        echo "Debug: the self generated default certificate is still valid for more than three months. Skipping default certificate creation."
+    elif [[ $DEBUG == true ]]; then
+        echo "Debug: the default certificate is user provided. Skipping default certificate creation."
     fi
 }
 
 source /app/functions.sh
 
-[[ $DEBUG == true ]] && set -x
-
 if [[ "$*" == "/bin/bash /app/start.sh" ]]; then
+    acmev2_re='https://acme-.*v02\.api\.letsencrypt\.org/directory'
+    if [[ "${ACME_CA_URI:-}" =~ $acmev2_re ]]; then
+        echo "Error: ACME v2 API is not yet supported by simp_le."
+        echo "See https://github.com/zenhack/simp_le/issues/101"
+        exit 1
+    fi
     check_docker_socket
-    if [[ -z "$(docker_gen_container)" ]]; then
-        [[ -z "${NGINX_PROXY_CONTAINER:-}" ]] && get_nginx_proxy_cid
+    if [[ -z "$(get_self_cid)" ]]; then
+        echo "Error: can't get my container ID !" >&2
+        exit 1
+    else
+        export SELF_CID="$(get_self_cid)"
+    fi
+    if [[ -z "$(get_nginx_proxy_container)" ]]; then
+        echo "Error: can't get nginx-proxy container ID !" >&2
+        echo "Check that you are doing one of the following :" >&2
+        echo -e "\t- Use the --volumes-from option to mount volumes from the nginx-proxy container." >&2
+        echo -e "\t- Set the NGINX_PROXY_CONTAINER env var on the letsencrypt-companion container to the name of the nginx-proxy container." >&2
+        echo -e "\t- Label the nginx-proxy container to use with 'com.github.jrcs.letsencrypt_nginx_proxy_companion.nginx_proxy'." >&2
+        exit 1
+    elif [[ -z "$(get_docker_gen_container)" ]] && ! is_docker_gen_container "$(get_nginx_proxy_container)"; then
+        echo "Error: can't get docker-gen container id !" >&2
+        echo "If you are running a three containers setup, check that you are doing one of the following :" >&2
+        echo -e "\t- Set the NGINX_DOCKER_GEN_CONTAINER env var on the letsencrypt-companion container to the name of the docker-gen container." >&2
+        echo -e "\t- Label the docker-gen container to use with 'com.github.jrcs.letsencrypt_nginx_proxy_companion.docker_gen.'" >&2
+        exit 1
     fi
     check_writable_directory '/etc/nginx/certs'
     check_writable_directory '/etc/nginx/vhost.d'
     check_writable_directory '/usr/share/nginx/html'
+    check_deprecated_env_var
+    check_default_cert_key
     check_dh_group
+    reload_nginx
 fi
 
 exec "$@"
