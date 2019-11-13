@@ -13,20 +13,20 @@ export -f get_base_domain
 function run_le_container {
   local image="${1:?}"
   local name="${2:?}"
+  local cli_args="${3:-}"
   if [[ "$SETUP" == '3containers' ]]; then
-    docker_gen_arg="--env NGINX_DOCKER_GEN_CONTAINER=$DOCKER_GEN_CONTAINER_NAME"
-  else
-    docker_gen_arg=""
+    cli_args+=" --env NGINX_DOCKER_GEN_CONTAINER=$DOCKER_GEN_CONTAINER_NAME"
   fi
   docker run -d \
     --name "$name" \
     --volumes-from $NGINX_CONTAINER_NAME \
     --volume /var/run/docker.sock:/var/run/docker.sock:ro \
-    $docker_gen_arg \
+    $cli_args \
     --env "DHPARAM_BITS=256" \
     --env "DEBUG=true" \
-    --env "ACME_CA_URI=http://${BOULDER_IP}:4000/directory" \
+    --env "ACME_CA_URI=http://boulder:4001/directory" \
     --label com.github.jrcs.letsencrypt_nginx_proxy_companion.test_suite \
+    --network boulder_bluenet \
     "$image" > /dev/null && echo "Started letsencrypt container for test ${name%%_2*}"
 }
 export -f run_le_container
@@ -39,8 +39,8 @@ function wait_for_symlink {
   local i=0
   local target
   until docker exec "$name" [ -L "/etc/nginx/certs/$domain.crt" ]; do
-    if [ $i -gt 180 ]; then
-      echo "Symlink for $domain certificate was not generated under three minutes, timing out."
+    if [ $i -gt 60 ]; then
+      echo "Symlink for $domain certificate was not generated under one minute, timing out."
       return 1
     fi
     i=$((i + 2))
@@ -53,14 +53,14 @@ function wait_for_symlink {
 export -f wait_for_symlink
 
 
-# Wait for the /etc/nginx/certs/$1.crt file to be removed inside container $2
+# Wait for the /etc/nginx/certs/$1.crt symlink to be removed inside container $2
 function wait_for_symlink_rm {
   local domain="${1:?}"
   local name="${2:?}"
   local i=0
-  until docker exec "$name" [ ! -f "/etc/nginx/certs/$domain.crt" ]; do
-    if [ $i -gt 120 ]; then
-      echo "Certificate symlink for $domain was not removed under two minutes, timing out."
+  until docker exec "$name" [ ! -L "/etc/nginx/certs/$domain.crt" ]; do
+    if [ $i -gt 60 ]; then
+      echo "Certificate symlink for $domain was not removed under one minute, timing out."
       return 1
     fi
     i=$((i + 2))

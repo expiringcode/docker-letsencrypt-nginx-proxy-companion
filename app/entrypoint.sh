@@ -23,9 +23,11 @@ function check_docker_socket {
 
 function check_writable_directory {
     local dir="$1"
-    docker_api "/containers/${SELF_CID:-$(get_self_cid)}/json" | jq ".Mounts[].Destination" | grep -q "^\"$dir\"$"
-    if [[ $? -ne 0 ]]; then
-        echo "Warning: '$dir' does not appear to be a mounted volume."
+    if [[ $(get_self_cid) ]]; then
+        docker_api "/containers/$(get_self_cid)/json" | jq ".Mounts[].Destination" | grep -q "^\"$dir\"$"
+        [[ $? -ne 0 ]] && echo "Warning: '$dir' does not appear to be a mounted volume."
+    else
+        echo "Warning: can't check if '$dir' is a mounted volume without self container ID."
     fi
     if [[ ! -d "$dir" ]]; then
         echo "Error: can't access to '$dir' directory !" >&2
@@ -62,6 +64,7 @@ function check_dh_group {
         local CURRENT_HASH=$(sha256sum "$DHPARAM_FILE" | cut -d ' ' -f1)
         if [[ "$PREGEN_HASH" != "$CURRENT_HASH" ]]; then
             # There is already a dhparam, and it's not the default
+            set_ownership_and_permissions "$DHPARAM_FILE"
             echo "Info: Custom Diffie-Hellman group found, generation skipped."
             return 0
           fi
@@ -78,17 +81,20 @@ is being created."
 
     # Put the default dhparam file in place so we can start immediately
     cp "$PREGEN_DHPARAM_FILE" "$DHPARAM_FILE"
+    set_ownership_and_permissions "$DHPARAM_FILE"
     touch "$GEN_LOCKFILE"
 
     # Generate a new dhparam in the background in a low priority and reload nginx when finished (grep removes the progress indicator).
     (
         (
-            nice -n +5 openssl dhparam -out "$DHPARAM_FILE" "$DHPARAM_BITS" 2>&1 \
+            nice -n +5 openssl dhparam -out "${DHPARAM_FILE}.new" "$DHPARAM_BITS" 2>&1 \
+            && mv "${DHPARAM_FILE}.new" "$DHPARAM_FILE" \
             && echo "Info: Diffie-Hellman group creation complete, reloading nginx." \
+            && set_ownership_and_permissions "$DHPARAM_FILE" \
             && reload_nginx
         ) | grep -vE '^[\.+]+'
         rm "$GEN_LOCKFILE"
-    ) &disown
+    ) & disown
 }
 
 function check_default_cert_key {
@@ -100,7 +106,7 @@ function check_default_cert_key {
         # than 3 months / 7776000 seconds (60 x 60 x 24 x 30 x 3).
         check_cert_min_validity /etc/nginx/certs/default.crt 7776000
         cert_validity=$?
-        [[ $DEBUG == true ]] && echo "Debug: a default certificate with $default_cert_cn is present."
+        [[ "$(lc $DEBUG)" == true ]] && echo "Debug: a default certificate with $default_cert_cn is present."
     fi
 
     # Create a default cert and private key if:
@@ -117,29 +123,26 @@ function check_default_cert_key {
         && mv /etc/nginx/certs/default.key.new /etc/nginx/certs/default.key \
         && mv /etc/nginx/certs/default.crt.new /etc/nginx/certs/default.crt
         echo "Info: a default key and certificate have been created at /etc/nginx/certs/default.key and /etc/nginx/certs/default.crt."
-    elif [[ $DEBUG == true && "${default_cert_cn:-}" =~ $cn ]]; then
+    elif [[ "$(lc $DEBUG)" == true && "${default_cert_cn:-}" =~ $cn ]]; then
         echo "Debug: the self generated default certificate is still valid for more than three months. Skipping default certificate creation."
-    elif [[ $DEBUG == true ]]; then
+    elif [[ "$(lc $DEBUG)" == true ]]; then
         echo "Debug: the default certificate is user provided. Skipping default certificate creation."
     fi
+    set_ownership_and_permissions "/etc/nginx/certs/default.key"
+    set_ownership_and_permissions "/etc/nginx/certs/default.crt"
 }
 
 source /app/functions.sh
 
 if [[ "$*" == "/bin/bash /app/start.sh" ]]; then
-    acmev2_re='https://acme-.*v02\.api\.letsencrypt\.org/directory'
-    if [[ "${ACME_CA_URI:-}" =~ $acmev2_re ]]; then
-        echo "Error: ACME v2 API is not yet supported by simp_le."
-        echo "See https://github.com/zenhack/simp_le/issues/101"
+    acmev1_r='acme-(v01\|staging)\.api\.letsencrypt\.org'
+    if [[ "${ACME_CA_URI:-}" =~ $acmev1_r ]]; then
+        echo "Error: the ACME v1 API is no longer supported by simp_le."
+        echo "See https://github.com/zenhack/simp_le/pull/119"
+        echo "Please use one of Let's Encrypt ACME v2 endpoints instead."
         exit 1
     fi
     check_docker_socket
-    if [[ -z "$(get_self_cid)" ]]; then
-        echo "Error: can't get my container ID !" >&2
-        exit 1
-    else
-        export SELF_CID="$(get_self_cid)"
-    fi
     if [[ -z "$(get_nginx_proxy_container)" ]]; then
         echo "Error: can't get nginx-proxy container ID !" >&2
         echo "Check that you are doing one of the following :" >&2

@@ -2,7 +2,7 @@
 
 ## Test for single domain certificates.
 
-if [[ -z $TRAVIS_CI ]]; then
+if [[ -z $TRAVIS ]]; then
   le_container_name="$(basename ${0%/*})_$(date "+%Y-%m-%d_%H.%M.%S")"
 else
   le_container_name="$(basename ${0%/*})"
@@ -12,6 +12,19 @@ run_le_container ${1:?} "$le_container_name"
 # Create the $domains array from comma separated domains in TEST_DOMAINS.
 IFS=',' read -r -a domains <<< "$TEST_DOMAINS"
 
+# Cleanup function with EXIT trap
+function cleanup {
+  # Remove any remaining Nginx container(s) silently.
+  for domain in "${domains[@]}"; do
+    docker rm --force "$domain" > /dev/null 2>&1
+  done
+  # Cleanup the files created by this run of the test to avoid foiling following test(s).
+  docker exec "$le_container_name" bash -c 'rm -rf /etc/nginx/certs/le?.wtf*'
+  # Stop the LE container
+  docker stop "$le_container_name" > /dev/null
+}
+trap cleanup EXIT
+
 # Run a separate nginx container for each domain in the $domains array.
 # Start all the containers in a row so that docker-gen debounce timers fire only once.
 for domain in "${domains[@]}"; do
@@ -19,6 +32,7 @@ for domain in "${domains[@]}"; do
     --name "$domain" \
     -e "VIRTUAL_HOST=${domain}" \
     -e "LETSENCRYPT_HOST=${domain}" \
+    --network boulder_bluenet \
     nginx:alpine > /dev/null && echo "Started test web server for $domain"
 done
 
@@ -62,7 +76,3 @@ for domain in "${domains[@]}"; do
   # Stop the Nginx container silently.
   docker stop "$domain" > /dev/null
 done
-
-# Cleanup the files created by this run of the test to avoid foiling following test(s).
-docker exec "$le_container_name" sh -c 'rm -rf /etc/nginx/certs/le?.wtf*'
-docker stop "$le_container_name" > /dev/null
