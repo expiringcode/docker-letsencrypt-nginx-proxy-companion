@@ -93,7 +93,7 @@ The containers being proxied must expose the port to be proxied, either by using
 
 If the proxyed container listen on and expose another port than the default `80`, you can force **nginx-proxy** to use this port with the [`VIRTUAL_PORT`](https://github.com/jwilder/nginx-proxy#multiple-ports) environment variable.
 
-Example using [Grafana](https://hub.docker.com/r/grafana/grafana/) (expose and listen on port 3000):
+Example using [Grafana](https://hub.docker.com/r/grafana/grafana/) (expose and listen on port 3000)
 
 ```shell
 $ docker run --detach \
